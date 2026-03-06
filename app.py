@@ -1,391 +1,218 @@
-import time
 import requests
-import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
-st.set_page_config(page_title="Radar Transparência", page_icon="🚨", layout="wide")
+st.set_page_config(page_title="Radar Transparência Pública", page_icon="🚨", layout="wide")
 
-MUNICIPIOS_SP = {
-    "Praia Grande":3541000,
-    "São Vicente":3551009,
-    "Santos":3548500,
-    "Guarujá":3518701,
-    "São Paulo":3550308
+MUNICIPIOS = {
+    "Santos": 3548500,
+    "Praia Grande": 3541000,
+    "São Vicente": 3551009,
+    "Guarujá": 3518701,
+    "Cubatão": 3513504,
+    "Mongaguá": 3531107,
 }
 
-URL="https://apidatalake.tesouro.gov.br/ords/siconfi/tt/rreo"
+URL_RREO = "https://apidatalake.tesouro.gov.br/ords/siconfi/tt/rreo"
 
 def brl(x):
     try:
-        return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-    except:
-        return "R$ 0"
+        return f"R$ {float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "R$ 0,00"
 
-def consultar_rreo(ano,bim,id_ente):
-    params={
-        "an_exercicio":ano,
-        "nr_periodo":bim,
-        "id_ente":id_ente,
-        "co_tipo_demonstrativo":"RREO"
+def consultar_rreo(ano, bimestre, id_ente):
+    params = {
+        "an_exercicio": int(ano),
+        "nr_periodo": int(bimestre),
+        "id_ente": int(id_ente),
+        "co_tipo_demonstrativo": "RREO",
     }
+    try:
+        r = requests.get(URL_RREO, params=params, timeout=40)
+        if r.status_code != 200:
+            return pd.DataFrame(), f"HTTP {r.status_code}"
+        data = r.json().get("items", [])
+        return pd.DataFrame(data), None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
 
-    r=requests.get(URL,params=params,timeout=30)
+def encontrar_coluna_valor(df):
+    prioridades = ["valor", "vl", "vl_receita", "vl_despesa", "vl_saldo"]
+    for c in prioridades:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().any():
+                return c
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().any():
+            return c
+    return None
 
-    if r.status_code!=200:
-        return pd.DataFrame()
+def encontrar_coluna_conta(df):
+    for c in ["no_conta", "co_conta", "descricao", "no_anexo"]:
+        if c in df.columns:
+            return c
+    return None
 
-    data=r.json().get("items",[])
-    return pd.DataFrame(data)
-
-def preparar(df):
-
+def preparar_df(df):
     if df.empty:
         return df
 
-    valor=None
+    valor_col = encontrar_coluna_valor(df)
+    conta_col = encontrar_coluna_conta(df)
 
-    for c in df.columns:
-        s=pd.to_numeric(df[c],errors="coerce")
-        if s.notna().sum()>0:
-            valor=c
-            break
-
-    df["_valor_base"]=pd.to_numeric(df[valor],errors="coerce")
-    df["_valor_abs"]=df["_valor_base"].abs()
-
-    conta=None
-
-    for c in ["no_conta","co_conta","descricao","no_anexo"]:
-        if c in df.columns:
-            conta=c
-            break
-
-    if conta:
-        df["_conta_ref"]=df[conta].astype(str)
+    if valor_col is None:
+        df["_valor_base"] = 0.0
     else:
-        df["_conta_ref"]="SEM_CONTA"
+        df["_valor_base"] = pd.to_numeric(df[valor_col], errors="coerce").fillna(0)
 
-    return df
+    df["_valor_abs"] = df["_valor_base"].abs()
 
-def score(df):
-
-    s=df["_valor_base"].dropna()
-
-    if len(s)<2:
-        df["_score"]=0
-        return df
-
-    media=s.mean()
-    desvio=s.std()
-
-    df["_z"]=(df["_valor_base"]-media)/desvio
-
-    df["_score"]=0
-    df.loc[df["_valor_abs"]>100000000,"_score"]+=1
-    df.loc[df["_valor_abs"]>500000000,"_score"]+=2
-    df.loc[df["_z"]>3,"_score"]+=2
+    if conta_col:
+        df["_conta_ref"] = df[conta_col].astype(str)
+    else:
+        df["_conta_ref"] = "SEM_CONTA"
 
     return df
 
 st.title("🚨 Radar Transparência Pública")
+st.caption("Auditoria automática em dados públicos do Tesouro (SICONFI/RREO).")
 
 with st.sidebar:
-
-    municipio=st.selectbox("Município",list(MUNICIPIOS_SP.keys()))
-    ano=st.selectbox("Ano",[2024,2023,2022])
-    bim=st.selectbox("Bimestre",[1,2,3,4,5,6])
-
-    valor_min=st.number_input("Modo investigação (R$)",0.0,100000000000.0,100000000.0)
-
-    consultar=st.button("Consultar")
+    st.header("⚙️ Filtros")
+    municipio = st.selectbox("Município", list(MUNICIPIOS.keys()), index=2)
+    ano = st.selectbox("Ano", [2025, 2024, 2023, 2022], index=2)
+    bimestre = st.selectbox("Bimestre", [1, 2, 3, 4, 5, 6], index=0)
+    valor_min = st.number_input("Modo investigação (R$)", min_value=0.0, value=100000000.0, step=50000000.0)
+    consultar = st.button("Consultar", use_container_width=True)
 
 if consultar:
+    id_ente = MUNICIPIOS[municipio]
 
-    id_ente=MUNICIPIOS_SP[municipio]
+    st.markdown("### 🏙️ Município (SICONFI)")
+    st.success(f"{municipio} | id_ente: {id_ente}")
 
-    with st.spinner("Consultando Tesouro..."):
-        df=consultar_rreo(ano,bim,id_ente)
+    with st.spinner("Consultando dados do Tesouro..."):
+        df, erro = consultar_rreo(ano, bimestre, id_ente)
 
-    if df.empty:
-        st.warning("Sem dados")
+    if erro:
+        st.error(f"Erro na consulta: {erro}")
         st.stop()
 
-    df=preparar(df)
-    df=score(df)
+    if df.empty:
+        st.warning("Nenhum dado encontrado para esse filtro.")
+        st.stop()
 
-    soma=df["_valor_base"].sum()
-    media=df["_valor_base"].mean()
-    desvio=df["_valor_base"].std()
+    df = preparar_df(df)
 
-    c1,c2,c3=st.columns(3)
+    soma = df["_valor_abs"].sum()
+    media = df["_valor_abs"].mean()
+    desvio = df["_valor_abs"].std()
 
-    c1.metric("Somatório",brl(soma))
-    c2.metric("Média",brl(media))
-    c3.metric("Desvio",brl(desvio))
+    st.markdown("### 📥 Dados RREO")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("💰 Somatório", brl(soma))
+    c2.metric("📊 Média", brl(media))
+    c3.metric("📉 Desvio", brl(0 if pd.isna(desvio) else desvio))
+
+    st.metric("📋 Linhas", len(df))
 
     st.markdown("### 🔥 Top 20 valores")
-
-    top=df.sort_values("_valor_abs",ascending=False).head(20)
-
-    st.dataframe(top,use_container_width=True)
+    top20 = df.sort_values("_valor_abs", ascending=False).head(20)
+    st.dataframe(top20[["_conta_ref", "_valor_base"]], use_container_width=True, hide_index=True)
 
     st.markdown("### ♻️ Repetições suspeitas")
-
-    rep=df["_valor_base"].round(2).value_counts().reset_index()
-    rep.columns=["valor","quantidade"]
-
-    rep=rep[rep["quantidade"]>=3].head(20)
-
-    st.dataframe(rep)
+    repet = (
+        df["_valor_base"].round(2)
+        .value_counts()
+        .reset_index()
+    )
+    repet.columns = ["valor", "quantidade"]
+    repet = repet[repet["quantidade"] >= 3].head(20)
+    if repet.empty:
+        st.info("Nenhuma repetição forte encontrada.")
+    else:
+        repet["valor"] = repet["valor"].apply(brl)
+        st.dataframe(repet, use_container_width=True, hide_index=True)
 
     st.markdown("### 🧩 Concentração por conta")
-
-    por_conta=df.groupby("_conta_ref")["_valor_abs"].sum().reset_index()
-
-    por_conta=por_conta.sort_values("_valor_abs",ascending=False).head(20)
-
-    st.dataframe(por_conta)
+    por_conta = (
+        df.groupby("_conta_ref")["_valor_abs"]
+        .sum()
+        .reset_index()
+        .sort_values("_valor_abs", ascending=False)
+        .head(20)
+    )
+    por_conta["_valor_abs"] = por_conta["_valor_abs"].apply(brl)
+    por_conta.columns = ["Conta", "Total"]
+    st.dataframe(por_conta, use_container_width=True, hide_index=True)
 
     st.markdown("### 🔎 Caminho do dinheiro")
-
-    fluxo=df.groupby("_conta_ref")["_valor_abs"].sum().reset_index()
-
-    fluxo=fluxo.sort_values("_valor_abs",ascending=False)
-
-    st.dataframe(fluxo.head(20))
+    fluxo = (
+        df.groupby("_conta_ref")["_valor_abs"]
+        .sum()
+        .reset_index()
+        .sort_values("_valor_abs", ascending=False)
+        .head(20)
+    )
+    fluxo["_valor_abs"] = fluxo["_valor_abs"].apply(brl)
+    fluxo.columns = ["Conta", "Dinheiro movimentado"]
+    st.dataframe(fluxo, use_container_width=True, hide_index=True)
 
     st.markdown("### 🕵️ Modo investigação")
-
-    inv=df[df["_valor_abs"]>=valor_min]
-
-    st.dataframe(inv,use_container_width=True)
-
-    st.markdown("### 📋 Tabela completa")
-
-    st.dataframe(df,use_container_width=True)
-
-
-import requests
-
-
-
-
-
-st.markdown("## 🏢 Contratos públicos")
-
-st.write("Consulta oficial de contratos públicos:")
-
-st.markdown(
-"[Abrir busca de contratos no PNCP](https://pncp.gov.br/app/contratos)"
-)
-
-st.info(
-"Use o PNCP para pesquisar empresas, contratos e valores pagos por órgãos públicos."
-)
-
-
-st.markdown("## 🚨 Detector automático de risco")
-
-try:
-
-    if "df" in locals() and not df.empty and "_valor_abs" in df.columns:
-
-        df_risco = df.copy()
-
-        media = df_risco["_valor_abs"].mean()
-        desvio = df_risco["_valor_abs"].std()
-
-        if desvio > 0:
-            df_risco["_zscore"] = (df_risco["_valor_abs"] - media) / desvio
-        else:
-            df_risco["_zscore"] = 0
-
-        df_risco["_risco"] = 0
-
-        df_risco.loc[df_risco["_valor_abs"] > media*5, "_risco"] += 1
-        df_risco.loc[df_risco["_zscore"] > 3, "_risco"] += 2
-        df_risco.loc[df_risco["_valor_abs"] > 100000000, "_risco"] += 2
-
-        suspeitos = df_risco[df_risco["_risco"] >= 2]
-
-        if not suspeitos.empty:
-
-            st.markdown("### ⚠️ Possíveis valores suspeitos")
-
-            suspeitos = suspeitos.sort_values("_valor_abs", ascending=False)
-
-            st.dataframe(
-                suspeitos.head(20),
-                use_container_width=True
-            )
-
-        else:
-
-            st.info("Nenhum padrão de risco forte encontrado.")
-
+    inv = df[df["_valor_abs"] >= valor_min].copy()
+    if inv.empty:
+        st.info("Nenhuma linha acima do valor mínimo.")
     else:
+        st.dataframe(inv[["_conta_ref", "_valor_base"]], use_container_width=True, hide_index=True)
 
-        st.info("Execute uma consulta primeiro.")
-
-except Exception:
-
-    st.warning("Erro ao analisar riscos.")
-
-
-st.markdown("## 🧠 Detector de anomalias por conta")
-
-try:
-
-    if "df" in locals() and not df.empty and "_valor_abs" in df.columns and "_conta_ref" in df.columns:
-
-        resultados = []
-
-        for conta, grupo in df.groupby("_conta_ref"):
-
-            valores = grupo["_valor_abs"].dropna()
-
-            if len(valores) < 5:
-                continue
-
-            media = valores.mean()
-            desvio = valores.std()
-
-            if desvio == 0:
-                continue
-
-            grupo = grupo.copy()
-
-            grupo["_z_conta"] = (grupo["_valor_abs"] - media) / desvio
-
-            suspeitos = grupo[grupo["_z_conta"] > 3]
-
-            if not suspeitos.empty:
-
-                resultados.append(suspeitos)
-
-        if resultados:
-
-            df_anomalias = pd.concat(resultados)
-
-            df_anomalias = df_anomalias.sort_values("_valor_abs", ascending=False)
-
-            st.markdown("### ⚠️ Possíveis anomalias dentro das contas")
-
-            st.dataframe(df_anomalias.head(20), use_container_width=True)
-
-        else:
-
-            st.info("Nenhuma anomalia forte encontrada dentro das contas.")
-
-    else:
-
-        st.info("Execute uma consulta primeiro.")
-
-except Exception:
-
-    st.warning("Erro ao analisar anomalias por conta.")
-
-
-import plotly.express as px
-
-st.markdown("## 📊 Mapa do dinheiro público")
-
-try:
-
-    if "df" in locals() and not df.empty and "_conta_ref" in df.columns:
-
-        resumo = (
-            df.groupby("_conta_ref")["_valor_abs"]
-            .sum()
-            .reset_index()
-            .sort_values("_valor_abs", ascending=False)
-        )
-
-        top = resumo.head(10)
-
-        fig = px.bar(
-            top,
-            x="_valor_abs",
-            y="_conta_ref",
-            orientation="h",
-            title="Contas com maior volume de dinheiro",
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    else:
-
-        st.info("Execute uma consulta primeiro.")
-
-except Exception:
-
-    st.warning("Erro ao gerar gráfico.")
-
-
-st.markdown("## 📊 Métricas rápidas")
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("💰 Somatório", brl(soma))
-col2.metric("📊 Média", brl(media))
-col3.metric("📉 Desvio", brl(desvio))
-col4.metric("⚠️ Alertas", len(suspeitos) if 'suspeitos' in locals() else 0)
-
-
-st.markdown("## 🌊 Comparação entre cidades da Baixada Santista")
-
-cidades = {
-"Santos":3548500,
-"Praia Grande":3541000,
-"São Vicente":3551009,
-"Guarujá":3518701,
-"Cubatão":3513502,
-"Mongaguá":3531107
-}
-
-dados_cidades = []
-
-for nome,id_cidade in cidades.items():
-
-    try:
-
-        df_tmp = consultar_rreo(ano,bim,id_cidade)
-
-        if not df_tmp.empty:
-
-            df_tmp = preparar(df_tmp)
-
-            total = df_tmp["_valor_base"].sum()
-
-            dados_cidades.append({
-                "Município": nome,
-                "Orçamento": total
-            })
-
-    except:
-        pass
-
-if dados_cidades:
-
-    df_comp = pd.DataFrame(dados_cidades)
-
-    st.dataframe(df_comp)
-
-    import plotly.express as px
-
-    fig = px.bar(
-        df_comp,
-        x="Município",
-        y="Orçamento",
-        title="Comparação de orçamento entre cidades"
+    st.markdown("### 📊 Mapa do dinheiro público")
+    graf = (
+        df.groupby("_conta_ref")["_valor_abs"]
+        .sum()
+        .reset_index()
+        .sort_values("_valor_abs", ascending=False)
+        .head(10)
     )
-
+    fig = px.bar(
+        graf,
+        x="_conta_ref",
+        y="_valor_abs",
+        title="Top 10 contas por valor",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("### 🏢 Contratos públicos")
+    st.write("Consulta oficial de contratos públicos:")
+    st.markdown("[Abrir busca de contratos no PNCP](https://pncp.gov.br/app/contratos)")
+    st.info("Use o PNCP para pesquisar empresas, contratos e valores por órgãos públicos.")
 
-# calcular estatísticas
-soma = df["_valor_abs"].sum()
-media = df["_valor_abs"].mean()
-desvio = df["_valor_abs"].std()
+    st.markdown("### 🌊 Comparação entre cidades da Baixada Santista")
+    dados_cidades = []
 
+    for nome, cidade_id in MUNICIPIOS.items():
+        try:
+            df_tmp, _ = consultar_rreo(ano, bimestre, cidade_id)
+            if not df_tmp.empty:
+                df_tmp = preparar_df(df_tmp)
+                dados_cidades.append({
+                    "Município": nome,
+                    "Orçamento": df_tmp["_valor_abs"].sum()
+                })
+        except Exception:
+            pass
+
+    if dados_cidades:
+        df_comp = pd.DataFrame(dados_cidades)
+        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        fig2 = px.bar(df_comp, x="Município", y="Orçamento", title="Comparação de orçamento entre cidades")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown("### 📋 Tabela completa")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+else:
+    st.info("Escolha os filtros e toque em Consultar.")
